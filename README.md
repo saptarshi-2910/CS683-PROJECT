@@ -3,7 +3,23 @@
 
 ## Project Overview
 
-This repository contains our complete work for the CS683 Final Project, focusing on the design, evaluation, and analysis of hardware prefetchers using the Berti Artifact (based on ChampSim).
+This project extends the **Berti Prefetcher (MICRO’22)** to improve performance on **server workloads**, which typically exhibit irregular memory access patterns, frequent phase changes, and large working sets. While baseline Berti performs well on SPEC/GAP-style workloads, it suffers from **cold-start issues**, **phase pollution**, and the inability to share useful patterns across different instruction pointers (IPs). :contentReference[oaicite:1]{index=1}
+
+To address these limitations, our team (**The Butterfly Effect**) introduces two major enhancements:
+
+### **1️⃣ Cross-IP Delta Correlation**
+- Builds a **Global Delta Graph** to track stride/delta patterns across *all* IPs.  
+- Helps new or transient IPs avoid cold-start by borrowing high-confidence deltas.  
+- Improves coverage, warm-up time, and overall IPC.  
+- Particularly effective for CloudSuite workloads where many IPs are short-lived. :contentReference[oaicite:2]{index=2}
+
+### **2️⃣ Phase-Aware Learning**
+- Detects execution phases using miss-rate signatures.  
+- Maintains **separate delta histories per phase**, preventing pattern pollution.  
+- Ensures each phase learns its own access behavior, improving prediction accuracy.  
+- Allows fast re-learning when phases repeat. :contentReference[oaicite:3]{index=3}
+
+---
 
 Our work includes:
 
