@@ -1,0 +1,1002 @@
+#include "vberti.h"
+
+#define LANZAR_INT 4  // Reduced from 6 for more aggressive prefetching
+
+void notify_prefetch(uint64_t addr, uint64_t tag, uint32_t cpu, uint64_t cycle)
+{
+    latency_table_add(addr, tag, cpu, 0, cycle & TIME_MASK);
+}
+
+bool compare_greater_stride_t(stride_t a, stride_t b)
+{
+    // Prioritize correlation-based strides slightly
+    if (a.from_correlation && !b.from_correlation && a.rpl >= L2) return 1;
+    if (!a.from_correlation && b.from_correlation && b.rpl >= L2) return 0;
+    
+    if (a.rpl == L1 && b.rpl != L1) return 1;
+    else if (a.rpl != L1 && b.rpl == L1) return 0;
+    else
+    {
+        if (a.rpl == L2 && b.rpl != L2) return 1;
+        else if (a.rpl != L2 && b.rpl == L2) return 0;
+        else
+        {
+            if (a.rpl == L2R && b.rpl != L2R) return 1;
+            if (a.rpl != L2R && b.rpl == L2R) return 0;
+            else
+            {
+                if (a.last_used > b.last_used) return 1;
+                if (std::abs(a.stride) < std::abs(b.stride)) return 1;
+                return 0;
+            }
+        }
+    }
+}
+
+bool compare_greater_stride_t_per(stride_t a, stride_t b)
+{
+    if (a.per > b.per) return 1;
+    else
+    {
+        if (std::abs(a.stride) < std::abs(b.stride)) return 1;
+        return 0;
+    }
+}
+
+/******************************************************************************/
+/*                      Latency table functions                               */
+/******************************************************************************/
+void latency_table_init(uint32_t cpu)
+{
+    for (uint32_t i = 0; i < LATENCY_TABLE_SIZE; i++)
+    {
+        latencyt[cpu][i].tag  = 0;
+        latencyt[cpu][i].addr = 0;
+        latencyt[cpu][i].time = 0;
+        latencyt[cpu][i].pf   = 0;
+    }
+}
+
+uint64_t latency_table_get_ip(uint64_t line_addr, uint32_t cpu)
+{
+    for (uint32_t i = 0; i < LATENCY_TABLE_SIZE; i++)
+    {
+        if (latencyt[cpu][i].addr == line_addr && latencyt[cpu][i].tag) 
+            return latencyt[cpu][i].tag;
+    }
+    return 0;
+}
+
+uint8_t latency_table_add(uint64_t line_addr, uint64_t tag, uint32_t cpu, uint8_t pf)
+{
+    return latency_table_add(line_addr, tag, cpu, pf, current_core_cycle[cpu] & TIME_MASK);
+}
+
+uint8_t latency_table_add(uint64_t line_addr, uint64_t tag, uint32_t cpu, uint8_t pf, uint64_t cycle)
+{
+    latency_table_t *free = nullptr;
+
+    for (uint32_t i = 0; i < LATENCY_TABLE_SIZE; i++)
+    {
+        if (latencyt[cpu][i].addr == line_addr) 
+        {
+            latencyt[cpu][i].time = cycle;
+            latencyt[cpu][i].tag  = tag;
+            latencyt[cpu][i].pf   = pf;
+            return latencyt[cpu][i].pf;
+        }
+        if (latencyt[cpu][i].tag == 0) free = &latencyt[cpu][i];
+    }
+
+    if (free == nullptr) return 0;
+
+    free->addr = line_addr;
+    free->time = cycle;
+    free->tag  = tag;
+    free->pf   = pf;
+
+    return free->pf;
+}
+
+uint64_t latency_table_del(uint64_t line_addr, uint32_t cpu)
+{
+    for (uint32_t i = 0; i < LATENCY_TABLE_SIZE; i++)
+    {
+        if (latencyt[cpu][i].addr == line_addr)
+        {
+            uint64_t latency = (current_core_cycle[cpu] & TIME_MASK) - latencyt[cpu][i].time;
+            latencyt[cpu][i].tag  = 0;
+            latencyt[cpu][i].time = 0;
+            latencyt[cpu][i].pf   = 0;
+            return latency;
+        }
+    }
+    return 0;
+}
+
+uint64_t latency_table_get(uint64_t line_addr, uint32_t cpu)
+{
+    for (uint32_t i = 0; i < LATENCY_TABLE_SIZE; i++)
+    {
+        if (latencyt[cpu][i].addr == line_addr) return latencyt[cpu][i].time;
+    }
+    return 0;
+}
+
+/******************************************************************************/
+/*                       Shadow Cache functions                               */
+/******************************************************************************/
+void shadow_cache_init(uint32_t cpu)
+{
+    for (uint8_t i = 0; i < L1D_SET; i++)
+    {
+        for (uint8_t ii = 0; ii < L1D_WAY; ii++)
+        {
+            scache[cpu][i][ii].addr = 0;
+            scache[cpu][i][ii].lat  = 0;
+            scache[cpu][i][ii].pf   = 0;
+        }
+    }
+}
+
+uint8_t shadow_cache_add(uint32_t cpu, uint32_t set, uint32_t way, 
+        uint64_t line_addr, uint8_t pf, uint64_t latency)
+{
+    scache[cpu][set][way].addr = line_addr;
+    scache[cpu][set][way].pf   = pf;
+    scache[cpu][set][way].lat  = latency;
+    return scache[cpu][set][way].pf;
+}
+
+uint8_t shadow_cache_get(uint32_t cpu, uint64_t line_addr)
+{
+    for (uint32_t i = 0; i < L1D_SET; i++)
+    {
+        for (uint32_t ii = 0; ii < L1D_WAY; ii++)
+        {
+            if (scache[cpu][i][ii].addr == line_addr) return 1;
+        }
+    }
+    return 0;
+}
+
+uint8_t shadow_cache_pf(uint32_t cpu, uint64_t line_addr)
+{
+    for (uint32_t i = 0; i < L1D_SET; i++)
+    {
+        for (uint32_t ii = 0; ii < L1D_WAY; ii++)
+        {
+            if (scache[cpu][i][ii].addr == line_addr) 
+            {
+                scache[cpu][i][ii].pf = 0;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+uint8_t shadow_cache_is_pf(uint32_t cpu, uint64_t line_addr)
+{
+    for (uint32_t i = 0; i < L1D_SET; i++)
+    {
+        for (uint32_t ii = 0; ii < L1D_WAY; ii++)
+        {
+            if (scache[cpu][i][ii].addr == line_addr) return scache[cpu][i][ii].pf;
+        }
+    }
+    return 0;
+}
+
+uint8_t shadow_cache_latency(uint32_t cpu, uint64_t line_addr)
+{
+    for (uint32_t i = 0; i < L1D_SET; i++)
+    {
+        for (uint32_t ii = 0; ii < L1D_WAY; ii++)
+        {
+            if (scache[cpu][i][ii].addr == line_addr) return scache[cpu][i][ii].lat;
+        }
+    }
+    assert(0);
+    return 0;
+}
+
+/******************************************************************************/
+/*                       History Table functions                              */
+/******************************************************************************/
+void history_table_init(uint32_t cpu)
+{
+    for (uint32_t i = 0; i < HISTORY_TABLE_SET; i++) 
+    {
+        history_pointers[cpu][i] = historyt[cpu][i];
+
+        for (uint32_t ii = 0; ii < HISTORY_TABLE_WAY; ii++) 
+        {
+            historyt[cpu][i][ii].tag = 0;
+            historyt[cpu][i][ii].time = 0;
+            historyt[cpu][i][ii].addr = 0;
+        }
+    }
+}
+
+void history_table_add(uint64_t tag, uint32_t cpu, uint64_t addr)
+{
+    uint16_t set = tag & TABLE_SET_MASK;
+    addr &= ADDR_MASK;
+
+    uint64_t cycle = current_core_cycle[cpu] & TIME_MASK;
+    
+    history_pointers[cpu][set]->tag       = tag;
+    history_pointers[cpu][set]->time      = cycle;
+    history_pointers[cpu][set]->addr      = addr;
+
+    if (history_pointers[cpu][set] == &historyt[cpu][set][HISTORY_TABLE_WAY - 1])
+    {
+        history_pointers[cpu][set] = &historyt[cpu][set][0];
+    } else history_pointers[cpu][set]++;
+}
+
+uint16_t history_table_get_aux(uint32_t cpu, uint32_t latency, 
+        uint64_t tag, uint64_t act_addr, uint64_t ip[HISTORY_TABLE_WAY],
+        uint64_t addr[HISTORY_TABLE_WAY], uint64_t cycle)
+{
+    uint16_t num_on_time = 0;
+    uint16_t set = tag & TABLE_SET_MASK;
+
+    if (cycle < latency) return num_on_time;
+    cycle -= latency; 
+
+    history_table_t *pointer = history_pointers[cpu][set];
+
+    do
+    {
+        if (pointer->tag == tag && pointer->time <= cycle)
+        {
+            if (pointer->addr == act_addr) return num_on_time;
+
+            int found = 0;
+            for (int i = 0; i < num_on_time; i++)
+            {
+                if (pointer->addr == addr[i]) return num_on_time;
+            }
+
+            ip[num_on_time]   = pointer->tag;
+            addr[num_on_time] = pointer->addr;
+            num_on_time++;
+        }
+
+        if (pointer == historyt[cpu][set])
+        {
+            pointer = &historyt[cpu][set][HISTORY_TABLE_WAY - 1];
+        } else pointer--;
+    } while (pointer != history_pointers[cpu][set]);
+
+    return num_on_time;
+}
+
+uint16_t history_table_get(uint32_t cpu, uint32_t latency, 
+        uint64_t tag, uint64_t act_addr,
+        uint64_t ip[HISTORY_TABLE_WAY],
+        uint64_t addr[HISTORY_TABLE_WAY], 
+        uint64_t cycle)
+{
+    act_addr &= ADDR_MASK;
+    return history_table_get_aux(cpu, latency, tag, act_addr, ip, addr, cycle);
+}
+
+/******************************************************************************/
+/*      AGGRESSIVE: Global Delta Graph (Cross-IP Correlation)                 */
+/******************************************************************************/
+void global_delta_init(uint32_t cpu)
+{
+    global_delta_graph[cpu].clear();
+    ip_correlation_map[cpu].clear();
+}
+
+void global_delta_add_aggressive(uint32_t cpu, int64_t delta, uint64_t ip)
+{
+    if (std::abs(delta) >= (1 << STRIDE_MASK)) return;
+    
+    // AGGRESSIVE: Sample every 4th call instead of every 8th
+    static uint64_t sample_counter[NUM_CPUS] = {0};
+    if (++sample_counter[cpu] % 4 != 0) return;
+    
+    uint64_t cycle = current_core_cycle[cpu] & TIME_MASK;
+    
+    // Create entry if doesn't exist
+    if (global_delta_graph[cpu].find(delta) == global_delta_graph[cpu].end()) {
+        if (global_delta_graph[cpu].size() >= GLOBAL_DELTA_TABLE_SIZE) {
+            // AGGRESSIVE: Evict oldest entry
+            int64_t oldest_delta = 0;
+            uint64_t oldest_time = UINT64_MAX;
+            for (const auto& pair : global_delta_graph[cpu]) {
+                if (pair.second.last_seen < oldest_time) {
+                    oldest_time = pair.second.last_seen;
+                    oldest_delta = pair.first;
+                }
+            }
+            global_delta_graph[cpu].erase(oldest_delta);
+        }
+        global_delta_graph[cpu][delta] = global_delta_entry_t();
+        global_delta_graph[cpu][delta].delta = delta;
+    }
+    
+    global_delta_entry_t& entry = global_delta_graph[cpu][delta];
+    
+    // AGGRESSIVE: Faster confidence build-up
+    entry.confidence += 2;  // Increment by 2 instead of 1
+    if (entry.confidence > 255) entry.confidence = 255;
+    
+    // Track unique IPs
+    if (entry.contributing_ips.find(ip) == entry.contributing_ips.end()) {
+        entry.contributing_ips.insert(ip);
+        entry.ip_count = entry.contributing_ips.size();
+        if (entry.ip_count > 255) entry.ip_count = 255;
+    }
+    
+    entry.last_seen = cycle;
+}
+
+std::vector<int64_t> global_delta_get_correlated_aggressive(uint32_t cpu, uint64_t ip)
+{
+    std::vector<int64_t> result;
+    result.reserve(8);  // Increased from 5
+    
+    // AGGRESSIVE: Lower threshold and get more candidates
+    std::vector<std::pair<int64_t, uint16_t>> candidates;
+    
+    for (const auto& pair : global_delta_graph[cpu]) {
+        // AGGRESSIVE: Much lower threshold (3 instead of 8)
+        if (pair.second.confidence >= GLOBAL_DELTA_CONFIDENCE_THRESHOLD) {
+            // Prioritize deltas used by multiple IPs
+            uint16_t score = pair.second.confidence + (pair.second.ip_count * 5);
+            candidates.push_back({pair.first, score});
+        }
+    }
+    
+    // Sort by score
+    std::sort(candidates.begin(), candidates.end(),
+              [](const std::pair<int64_t, uint16_t>& a,
+                 const std::pair<int64_t, uint16_t>& b) { return a.second > b.second; });
+    
+    // AGGRESSIVE: Take top 8 instead of top 5
+    for (size_t i = 0; i < std::min(candidates.size(), size_t(8)); i++) {
+        result.push_back(candidates[i].first);
+    }
+    
+    return result;
+}
+
+/******************************************************************************/
+/*              AGGRESSIVE: Phase Detection                                   */
+/******************************************************************************/
+void phase_detection_init(uint32_t cpu)
+{
+    phase_info[cpu].current_phase = 0;
+    phase_info[cpu].prev_phase = 0;
+    phase_info[cpu].last_phase_check = 0;
+    phase_info[cpu].phase_transition_count = 0;
+    phase_info[cpu].sample_misses = 0;
+    phase_info[cpu].sample_accesses = 0;
+    
+    for (int i = 0; i < NUM_PHASES; i++) {
+        phase_info[cpu].signatures[i] = phase_signature_t();
+    }
+}
+
+void phase_signature_update_aggressive(uint32_t cpu, bool is_miss)
+{
+    phase_info_t& pinfo = phase_info[cpu];
+    
+    pinfo.sample_accesses++;
+    if (is_miss) {
+        pinfo.sample_misses++;
+    }
+}
+
+uint8_t phase_detect_aggressive(uint32_t cpu)
+{
+    uint64_t cycle = current_core_cycle[cpu] & TIME_MASK;
+    phase_info_t& pinfo = phase_info[cpu];
+    
+    // AGGRESSIVE: Check every 10K cycles instead of 25K
+    if ((cycle - pinfo.last_phase_check) < 10000) {
+        return pinfo.current_phase;
+    }
+    
+    pinfo.last_phase_check = cycle;
+    
+    // Need minimum samples
+    if (pinfo.sample_accesses < 50) return pinfo.current_phase;  // Reduced from 100
+    
+    uint32_t current_miss_rate = (pinfo.sample_misses * 100) / pinfo.sample_accesses;
+    
+    // Find best matching phase
+    uint8_t best_phase = pinfo.current_phase;
+    uint32_t best_diff = 100;
+    
+    for (uint8_t i = 0; i < NUM_PHASES; i++) {
+        if (pinfo.signatures[i].sample_count == 0) continue;
+        
+        uint32_t diff = (current_miss_rate > pinfo.signatures[i].miss_rate) ?
+            (current_miss_rate - pinfo.signatures[i].miss_rate) :
+            (pinfo.signatures[i].miss_rate - current_miss_rate);
+        
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_phase = i;
+        }
+    }
+    
+    // AGGRESSIVE: Transition threshold reduced from 12 to 8
+    if (best_diff > PHASE_MISS_RATE_THRESHOLD) {
+        uint8_t new_phase = pinfo.current_phase;
+        
+        // Find unused phase or reuse oldest
+        uint64_t oldest_time = UINT64_MAX;
+        for (uint8_t i = 0; i < NUM_PHASES; i++) {
+            if (pinfo.signatures[i].sample_count == 0) {
+                new_phase = i;
+                break;
+            }
+            if (pinfo.signatures[i].last_update < oldest_time) {
+                oldest_time = pinfo.signatures[i].last_update;
+                new_phase = i;
+            }
+        }
+        
+        pinfo.signatures[new_phase].miss_rate = current_miss_rate;
+        pinfo.signatures[new_phase].sample_count = pinfo.sample_accesses;
+        pinfo.signatures[new_phase].last_update = cycle;
+        pinfo.prev_phase = pinfo.current_phase;
+        pinfo.current_phase = new_phase;
+        pinfo.phase_transition_count++;
+    } else if (best_phase != pinfo.current_phase) {
+        pinfo.prev_phase = pinfo.current_phase;
+        pinfo.current_phase = best_phase;
+        pinfo.phase_transition_count++;
+    }
+    
+    pinfo.sample_misses = 0;
+    pinfo.sample_accesses = 0;
+    
+    return pinfo.current_phase;
+}
+
+void phase_vberti_add_aggressive(uint64_t tag, uint32_t cpu, int64_t stride, uint8_t phase)
+{
+    if (phase_vbertit[cpu].find(tag) == phase_vbertit[cpu].end()) {
+        phase_vbertit[cpu][tag] = std::map<uint8_t, vberti_t*>();
+    }
+    
+    if (phase_vbertit[cpu][tag].find(phase) == phase_vbertit[cpu][tag].end())
+    {
+        // AGGRESSIVE: Increased size limit
+        if (phase_vbertit[cpu].size() > BERTI_TABLE_SIZE * 3) {
+            return;
+        }
+        
+        vberti_t *tmp = new vberti_t;
+        tmp->stride = new stride_t[BERTI_TABLE_STRIDE_SIZE]();
+        tmp->conf = CONFIDENCE_INC;
+        tmp->phase_id = phase;
+        tmp->needs_help = 0;
+        tmp->last_access = current_core_cycle[cpu];
+        tmp->access_count = 1;
+        
+        tmp->stride[0].stride = stride;
+        tmp->stride[0].conf = CONFIDENCE_INIT;
+        tmp->stride[0].rpl = L2R;  // Start more aggressive
+        tmp->stride[0].last_used = current_core_cycle[cpu];
+        
+        phase_vbertit[cpu][tag][phase] = tmp;
+        return;
+    }
+    
+    vberti_t *tmp = phase_vbertit[cpu][tag][phase];
+    stride_t *aux = tmp->stride;
+    uint64_t cycle = current_core_cycle[cpu];
+    
+    tmp->last_access = cycle;
+    tmp->access_count++;
+    
+    for (int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++)
+    {
+        if (aux[i].stride == stride)
+        {
+            aux[i].conf += CONFIDENCE_INC;
+            if (aux[i].conf > CONFIDENCE_MAX) aux[i].conf = CONFIDENCE_MAX;
+            aux[i].last_used = cycle;
+            
+            // AGGRESSIVE: Promote to higher cache level faster
+            if (aux[i].conf >= CONFIDENCE_L1 && aux[i].rpl < L1) aux[i].rpl = L1;
+            else if (aux[i].conf >= CONFIDENCE_L2 && aux[i].rpl < L2) aux[i].rpl = L2;
+            
+            return;
+        }
+    }
+    
+    // Find empty or replaceable slot
+    for (int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++)
+    {
+        if (aux[i].stride == 0 || aux[i].conf < CONFIDENCE_INIT)
+        {
+            tmp->stride[i].stride = stride;
+            tmp->stride[i].conf   = CONFIDENCE_INIT;
+            tmp->stride[i].rpl    = L2R;  // Start more aggressive
+            tmp->stride[i].last_used = cycle;
+            return;
+        }
+    }
+}
+
+uint8_t phase_vberti_get_aggressive(uint64_t tag, uint32_t cpu, uint8_t phase, stride_t res[MAX_PF])
+{
+    if (phase_vbertit[cpu].find(tag) == phase_vbertit[cpu].end()) return 0;
+    if (phase_vbertit[cpu][tag].find(phase) == phase_vbertit[cpu][tag].end()) {
+        // AGGRESSIVE: Try previous phase if current phase has no data
+        uint8_t prev_phase = phase_info[cpu].prev_phase;
+        if (phase_vbertit[cpu][tag].find(prev_phase) == phase_vbertit[cpu][tag].end()) {
+            return 0;
+        }
+        phase = prev_phase;
+    }
+    
+    vberti_t *tmp = phase_vbertit[cpu][tag][phase];
+    stride_t *aux = tmp->stride;
+    uint16_t dx = 0;
+    
+    for (int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++)
+    {
+        if (aux[i].stride != 0 && dx < MAX_PF)
+        {
+            // AGGRESSIVE: Use even low-confidence strides if phase is stable
+            if (aux[i].conf >= CONFIDENCE_INIT || tmp->access_count > 5) {
+                res[dx] = aux[i];
+                dx++;
+            }
+        }
+    }
+    
+    if (dx > 0) {
+        std::sort(res, res + dx, compare_greater_stride_t);
+        return 1;
+    }
+    
+    return 0;
+}
+
+/******************************************************************************/
+/*                      VBerti Table functions (AGGRESSIVE)                   */
+/******************************************************************************/
+void vberti_increase_conf_ip(uint64_t tag, uint32_t cpu)
+{
+    if (vbertit[cpu].find(tag) == vbertit[cpu].end()) return;
+
+    vberti_t *tmp = vbertit[cpu][tag];
+    stride_t *aux = tmp->stride;
+
+    tmp->conf += CONFIDENCE_INC;
+
+    if (tmp->conf >= CONFIDENCE_MAX) 
+    {
+        for(int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++)
+        {
+            float temp = (float) aux[i].conf / (float) tmp->conf;
+            uint64_t aux_conf = (uint64_t) (temp * 100);
+
+            // AGGRESSIVE: Lower thresholds
+            if (aux_conf > CONFIDENCE_L1) aux[i].rpl = L1;
+            else if (aux_conf > CONFIDENCE_L2) aux[i].rpl = L2;
+            else if (aux_conf > CONFIDENCE_L2R) aux[i].rpl = L2R;
+            else aux[i].rpl = R;
+            
+            aux[i].conf = 0;
+        }
+        tmp->conf = 0;
+    }
+    
+    // Mark if IP needs help from correlation
+    tmp->needs_help = (tmp->conf < MIN_IP_CONFIDENCE_FOR_CORRELATION) ? 1 : 0;
+}
+
+void vberti_table_add(uint64_t tag, uint32_t cpu, int64_t stride)
+{
+    uint8_t current_phase = phase_info[cpu].current_phase;
+    uint64_t cycle = current_core_cycle[cpu];
+    
+    // AGGRESSIVE: Always add to global delta graph (no sampling)
+    global_delta_add_aggressive(cpu, stride, tag);
+    
+    // AGGRESSIVE: Always add to phase-specific table if phases exist
+    if (phase_info[cpu].phase_transition_count > 0) {
+        phase_vberti_add_aggressive(tag, cpu, stride, current_phase);
+    }
+    
+    // Main vBerti table
+    if (vbertit[cpu].find(tag) == vbertit[cpu].end())
+    {
+        if (vbertit_queue[cpu].size() >= BERTI_TABLE_SIZE)
+        {
+            uint64_t key = vbertit_queue[cpu].front();
+            vberti_t *tmp = vbertit[cpu][key];
+            delete tmp->stride;
+            delete tmp;
+            vbertit[cpu].erase(key);
+            vbertit_queue[cpu].pop();
+        }
+        vbertit_queue[cpu].push(tag);
+
+        vberti_t *tmp = new vberti_t;
+        tmp->stride = new stride_t[BERTI_TABLE_STRIDE_SIZE]();
+        tmp->conf = CONFIDENCE_INC;
+        tmp->phase_id = current_phase;
+        tmp->needs_help = 1;
+        tmp->last_access = cycle;
+        tmp->access_count = 1;
+
+        tmp->stride[0].stride = stride;
+        tmp->stride[0].conf = CONFIDENCE_INIT;
+        tmp->stride[0].rpl = R;
+        tmp->stride[0].last_used = cycle;
+
+        vbertit[cpu].insert(std::make_pair(tag, tmp));
+        return;
+    }
+
+    vberti_t *tmp = vbertit[cpu][tag];
+    stride_t *aux = tmp->stride;
+    
+    tmp->last_access = cycle;
+    tmp->access_count++;
+
+    for (int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++)
+    {
+        if (aux[i].stride == stride)
+        {
+            aux[i].conf += CONFIDENCE_INC;
+            if (aux[i].conf > CONFIDENCE_MAX) aux[i].conf = CONFIDENCE_MAX;
+            aux[i].last_used = cycle;
+            return;
+        }
+    }
+
+    uint8_t dx_conf = 100;
+    int dx_remove = -1;
+    for (int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++)
+    {
+        if (aux[i].rpl == R && aux[i].conf < dx_conf)
+        {
+            dx_conf = aux[i].conf;
+            dx_remove = i;
+        }
+    }
+
+    if (dx_remove > -1)
+    {
+        tmp->stride[dx_remove].stride = stride;
+        tmp->stride[dx_remove].conf   = CONFIDENCE_INIT;
+        tmp->stride[dx_remove].rpl    = R;
+        tmp->stride[dx_remove].last_used = cycle;
+        return;
+    }
+    
+    for (int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++)
+    {
+        if (aux[i].rpl == L2R && aux[i].conf < dx_conf)
+        {
+            dx_conf = aux[i].conf;
+            dx_remove = i;
+        }
+    }
+    if (dx_remove > -1)
+    {
+        tmp->stride[dx_remove].stride = stride;
+        tmp->stride[dx_remove].conf   = CONFIDENCE_INIT;
+        tmp->stride[dx_remove].rpl    = R;
+        tmp->stride[dx_remove].last_used = cycle;
+    }
+}
+
+uint8_t vberti_table_get(uint64_t tag, uint32_t cpu, stride_t res[MAX_PF])
+{
+    uint8_t current_phase = phase_info[cpu].current_phase;
+    uint64_t cycle = current_core_cycle[cpu];
+    
+    // Try main table first
+    bool has_main_entry = vbertit[cpu].count(tag) > 0;
+    
+    if (!has_main_entry) {
+        // AGGRESSIVE: Unknown IP - ALWAYS try correlation
+        std::vector<int64_t> correlated = global_delta_get_correlated_aggressive(cpu, tag);
+        if (!correlated.empty()) {
+            uint16_t dx = 0;
+            for (int64_t delta : correlated) {
+                if (dx >= MAX_PF) break;
+                res[dx].stride = delta;
+                res[dx].rpl = L2;  // Conservative for correlated
+                res[dx].conf = CONFIDENCE_INIT;
+                res[dx].last_used = cycle;
+                res[dx].from_correlation = 1;
+                dx++;
+            }
+            if (dx > 0) {
+                std::sort(res, res + dx, compare_greater_stride_t);
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    vberti_t *tmp = vbertit[cpu][tag];
+    stride_t *aux = tmp->stride;
+    uint16_t dx = 0;
+    
+    // Get strides from main table
+    for (int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++)
+    {
+        if (aux[i].stride != 0 && aux[i].rpl && dx < MAX_PF)
+        {
+            res[dx] = aux[i];
+            dx++;
+        }
+    }
+
+    // AGGRESSIVE: Use percentage-based approach even with fewer strides
+    if (dx < 5 && tmp->conf >= LANZAR_INT)
+    {
+        dx = 0;  // Reset
+        for (int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++)
+        {
+            if (aux[i].stride != 0)
+            {
+                res[dx].stride = aux[i].stride;
+                float temp = (float) aux[i].conf / (float) tmp->conf;
+                uint64_t aux_conf = (uint64_t) (temp * 100);
+                res[dx].per = aux_conf;
+                res[dx].last_used = aux[i].last_used;
+                dx++;
+            }
+        }
+        std::sort(res, res + MAX_PF, compare_greater_stride_t_per);
+
+        // AGGRESSIVE: Lower percentage thresholds
+        for (int i = 0; i < MAX_PF; i++)
+        {
+            if (res[i].per > 60) res[i].rpl = L1;     // Down from 75
+            else if (res[i].per > 25) res[i].rpl = L2;  // Down from 35
+            else res[i].rpl = L2R;  // Instead of R - more aggressive
+        }
+    }
+    
+    // AGGRESSIVE: ALWAYS try phase-specific and correlation if weak
+    if (dx < 6) {
+        // Try phase-specific table
+        stride_t phase_res[MAX_PF];
+        for (int i = 0; i < MAX_PF; i++) phase_res[i] = stride_t();
+        
+        if (phase_vberti_get_aggressive(tag, cpu, current_phase, phase_res)) {
+            // Merge unique strides
+            for (int i = 0; i < MAX_PF && dx < MAX_PF; i++) {
+                if (phase_res[i].stride != 0) {
+                    bool duplicate = false;
+                    for (int j = 0; j < dx; j++) {
+                        if (res[j].stride == phase_res[i].stride) {
+                            duplicate = true;
+                            // Boost confidence if found in both
+                            if (res[j].rpl < L2) res[j].rpl = L2;
+                            break;
+                        }
+                    }
+                    if (!duplicate) {
+                        res[dx++] = phase_res[i];
+                    }
+                }
+            }
+        }
+        
+        // Try correlation for weak IPs
+        if (dx < 8 && tmp->needs_help) {
+            std::vector<int64_t> correlated = global_delta_get_correlated_aggressive(cpu, tag);
+            for (int64_t delta : correlated) {
+                if (dx >= MAX_PF) break;
+                
+                bool duplicate = false;
+                for (int j = 0; j < dx; j++) {
+                    if (res[j].stride == delta) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                
+                if (!duplicate) {
+                    res[dx].stride = delta;
+                    res[dx].rpl = L2R;  // Conservative for correlated
+                    res[dx].conf = CONFIDENCE_INIT;
+                    res[dx].last_used = cycle;
+                    res[dx].from_correlation = 1;
+                    dx++;
+                }
+            }
+        }
+    }
+
+    if (dx > 0) {
+        std::sort(res, res + dx, compare_greater_stride_t);
+        return 1;
+    }
+    
+    return 0;
+}
+
+void find_and_update(uint32_t cpu, uint64_t latency, uint64_t tag, 
+        uint64_t cycle, uint64_t line_addr)
+{ 
+    uint64_t ip[HISTORY_TABLE_WAY];
+    uint64_t addr[HISTORY_TABLE_WAY];
+    uint16_t num_on_time = 0;
+
+    num_on_time = history_table_get(cpu, latency, tag, line_addr, ip, addr, cycle);
+    
+    for (uint32_t i = 0; i < num_on_time; i++)
+    {
+        if (i == 0) vberti_increase_conf_ip(tag, cpu);
+        
+        if (i >= MAX_HISTORY_IP) break;
+
+        int64_t stride;
+        line_addr &= ADDR_MASK;
+
+        stride = (int64_t) (line_addr - addr[i]);
+
+        if ((std::abs(stride) < (1 << STRIDE_MASK)))
+        {
+            vberti_table_add(ip[i], cpu, stride);
+        }
+    }
+}
+
+/******************************************************************************/
+/*                      Main Prefetcher Functions (AGGRESSIVE)                */
+/******************************************************************************/
+void CACHE::l1d_prefetcher_initialize() 
+{
+    shadow_cache_init(cpu);
+    latency_table_init(cpu);
+    history_table_init(cpu);
+    global_delta_init(cpu);
+    phase_detection_init(cpu);
+
+    std::cout << "=== AGGRESSIVE MILESTONE 1: Server-Optimized vBerti ===" << std::endl;
+    std::cout << "History Sets: " << HISTORY_TABLE_SET << std::endl;
+    std::cout << "History Ways: " << HISTORY_TABLE_WAY << std::endl;
+    std::cout << "BERTI Size: " << BERTI_TABLE_SIZE << std::endl;
+    std::cout << "BERTI Stride Size: " << BERTI_TABLE_STRIDE_SIZE << std::endl;
+    std::cout << "Global Delta Size: " << GLOBAL_DELTA_TABLE_SIZE << std::endl;
+    std::cout << "Num Phases: " << NUM_PHASES << std::endl;
+    std::cout << "Features: AGGRESSIVE Cross-IP + Phase Detection" << std::endl;
+    std::cout << "Confidence L1: " << CONFIDENCE_L1 << "% | L2: " << CONFIDENCE_L2 << "% | L2R: " << CONFIDENCE_L2R << "%" << std::endl;
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit,
+        uint8_t type, uint8_t critical_ip_flag)
+{
+    assert(type == LOAD || type == RFO);
+    
+    uint64_t line_addr = (addr >> LOG2_BLOCK_SIZE);
+    
+    ip = ((ip >> 1) ^ (ip >> 4));
+    ip = ip & IP_MASK;
+
+    // AGGRESSIVE: Phase detection every 200 accesses instead of 500
+    static uint64_t phase_check_counter[NUM_CPUS] = {0};
+    if (++phase_check_counter[cpu] % 200 == 0) {
+        phase_detect_aggressive(cpu);
+    }
+    
+    if (!cache_hit)
+    {
+        latency_table_add(line_addr, ip, cpu, 1);
+        history_table_add(ip, cpu, line_addr);
+        phase_signature_update_aggressive(cpu, true);
+    } 
+    else if (cache_hit && shadow_cache_is_pf(cpu, line_addr))
+    {
+        shadow_cache_pf(cpu, line_addr);
+
+        uint64_t latency = shadow_cache_latency(cpu, line_addr);
+        find_and_update(cpu, latency, ip, current_core_cycle[cpu] & TIME_MASK, line_addr);
+
+        history_table_add(ip, cpu, line_addr);
+        phase_signature_update_aggressive(cpu, false);
+    } 
+    else
+    {
+        shadow_cache_pf(cpu, line_addr);
+        phase_signature_update_aggressive(cpu, false);
+    }
+
+    // Get strides to prefetch
+    stride_t stride_res[MAX_PF];
+    for (int i = 0; i < MAX_PF; i++) 
+    {
+        stride_res[i] = stride_t();
+    }
+
+    if (!vberti_table_get(ip, cpu, stride_res)) return;
+
+    int launched = 0;
+    // AGGRESSIVE: Try to launch more prefetches
+    for (int i = 0; i < MAX_PF_LAUNCH && launched < MAX_PF_LAUNCH; i++)
+    {
+        if (stride_res[i].stride == 0) break;
+        
+        uint64_t p_addr = (line_addr + stride_res[i].stride) << LOG2_BLOCK_SIZE;
+
+        if (!latency_table_get(p_addr, cpu))
+        {
+            int fill_level = FILL_L1;
+            float mshr_load = ((float) MSHR.occupancy / (float) MSHR_SIZE) * 100;
+
+            // AGGRESSIVE: More willing to prefetch to L1
+            if (stride_res[i].rpl == L1 && mshr_load < MSHR_LIMIT)
+            {
+                fill_level = FILL_L1;
+            } 
+            else if (stride_res[i].rpl >= L2R)  // Include L2R, L2, L1
+            {
+                fill_level = FILL_L2;
+            } 
+            else
+            {
+                // AGGRESSIVE: Even R-level strides go to L2 if from correlation
+                if (stride_res[i].from_correlation) {
+                    fill_level = FILL_L2;
+                } else {
+                    continue;
+                }
+            }
+
+            if (prefetch_line(ip, addr, p_addr, fill_level, 1))
+            {
+                launched++;
+            }
+        }
+    }
+}
+
+void CACHE::l1d_prefetcher_notify_about_dtlb_eviction(uint64_t addr, 
+        uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, 
+        uint32_t metadata_in)
+{
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, 
+        uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, 
+        uint64_t evicted_addr, uint32_t metadata_in)
+{
+    uint64_t line_addr = (v_addr >> LOG2_BLOCK_SIZE);
+
+    uint64_t tag     = latency_table_get_ip(line_addr, cpu);
+    uint64_t cycle   = latency_table_get(line_addr, cpu);
+    uint64_t latency = latency_table_del(line_addr, cpu);
+
+    if (latency > LAT_MASK) latency = 0;
+
+    shadow_cache_add(cpu, set, way, line_addr, prefetch, latency);
+
+    if (latency != 0 && !prefetch)
+    {
+        find_and_update(cpu, latency, tag, cycle, line_addr);
+    }
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+    std::cout << "=== AGGRESSIVE MILESTONE 1 Stats (CPU " << cpu << ") ===" << std::endl;
+    std::cout << "Phase Transitions: " << phase_info[cpu].phase_transition_count << std::endl;
+    std::cout << "Current Phase: " << (int)phase_info[cpu].current_phase << std::endl;
+    std::cout << "Global Deltas Tracked: " << global_delta_graph[cpu].size() << std::endl;
+    std::cout << "Phase Tables: " << phase_vbertit[cpu].size() << std::endl;
+    std::cout << "Main vBerti Entries: " << vbertit[cpu].size() << std::endl;
+}
