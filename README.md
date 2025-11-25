@@ -23,18 +23,32 @@ Watch our detailed explanation video here:
 
 ---
 
-## Final Outputs
+## 📌 Simulation Configuration
 
-All final results generated for the project are in:
+For all our experiments, we used the following configuration:
 
-**Berti-Artifact/UpdatedBerti/**
+- **Warmup Instructions:** 5 Million  
+- **Simulation Instructions:** 20 Million  
+
+These settings were consistently applied across all workloads and prefetcher evaluations.
+
+---
+
+## 📂 Result Directories
+
+All results generated during the project are stored in the following folders:
+
+- **Original baseline results:**  
+  `Berti-Artifact/Originalberti_results/`
+
+- **Our updated final results:**  
+  `Berti-Artifact/UpdatedBerti/`
+
 
 Contains:
 
 - IPC/MPKI CSVs  
-- Suite-wise analysis  
 - Prefetcher comparison  
-- Multi-core plots  
 - Final graphs used in the report and presentation  
 
 ---
